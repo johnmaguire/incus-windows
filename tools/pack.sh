@@ -74,19 +74,74 @@ xorriso -as mkisofs -o "${DESTDIR}/unattended-${VERSION}.iso" -R -J -V STUFF "${
 
 apparmr() {
 	cat<<__EOF__
-${WINDIR}/${WINFILE} rwk,
-${DESTDIR}/unattended-${VERSION}.iso rwk,
+${WINPATH} rwk,
+${UNATTPATH} rwk,
 __EOF__
 }
+
+# -------------------------------------------------------------------- #
+# ISO paths
+#
+# By default the Incus server is local and QEMU can open the ISO files
+# directly, so WINPATH/UNATTPATH are simply the paths we built here.
+#
+# When INCUS_WINDOWS_SSH is set the Incus server is remote: the QEMU
+# process there cannot open this workstation's paths. In that case ship
+# both ISOs to the server over SSH and switch WINPATH/UNATTPATH to the
+# server-side copies. INCUS_WINDOWS_SSH must resolve via the caller's
+# ssh config. Leaving it unset preserves the original local behaviour.
+
+WINPATH="${WINDIR}/${WINFILE}"
+UNATTPATH="${DESTDIR}/unattended-${VERSION}.iso"
+
+if [ -n "${INCUS_WINDOWS_SSH:-}" ]; then
+	RWORKDIR="/var/tmp/incus-windows-build"
+	printf '[+] Staging ISOs on the Incus host (%s)\n' "${INCUS_WINDOWS_SSH}"
+	ssh "${INCUS_WINDOWS_SSH}" "mkdir -p '${RWORKDIR}'"
+
+	# The Windows ISO is large and immutable; skip the upload when the
+	# server already holds a copy with the same sha256. The server-side
+	# hash lives in a marker file so the cached copy is not re-hashed on
+	# every run; writing it from a post-upload remote hash also verifies
+	# the transfer.
+	# sha256sum is GNU/Linux, shasum is macOS/BSD
+	if command -v sha256sum >/dev/null 2>&1; then
+		_lsum=$(sha256sum "${WINPATH}")
+	else
+		_lsum=$(shasum -a 256 "${WINPATH}")
+	fi
+	_lsum="${_lsum%% *}"
+	_rsum=$(ssh "${INCUS_WINDOWS_SSH}" "cat '${RWORKDIR}/${WINFILE}.sha256' 2>/dev/null || :")
+	if [ X"${_lsum}" != X"${_rsum}" ]; then
+		printf '[+] Uploading Windows ISO\n'
+		scp "${WINPATH}" "${INCUS_WINDOWS_SSH}:${RWORKDIR}/${WINFILE}"
+		_rsum=$(ssh "${INCUS_WINDOWS_SSH}" "sha256sum '${RWORKDIR}/${WINFILE}'")
+		_rsum="${_rsum%% *}"
+		if [ X"${_lsum}" != X"${_rsum}" ]; then
+			printf 'error: Windows ISO upload corrupted (sha256 mismatch)\n' >&2
+			exit 1
+		fi
+		ssh "${INCUS_WINDOWS_SSH}" "printf '%s\n' '${_rsum}' >'${RWORKDIR}/${WINFILE}.sha256'"
+	else
+		printf '[+] Windows ISO already cached on host\n'
+	fi
+
+	# The unattended ISO is rebuilt on every run; always re-upload it.
+	printf '[+] Uploading unattended ISO\n'
+	scp "${UNATTPATH}" "${INCUS_WINDOWS_SSH}:${RWORKDIR}/unattended-${VERSION}.iso"
+
+	WINPATH="${RWORKDIR}/${WINFILE}"
+	UNATTPATH="${RWORKDIR}/unattended-${VERSION}.iso"
+fi
 
 printf '[+] Launching the VM\n'
 
 incus init "${name}" --empty --vm -c security.secureboot=false -c limits.cpu=4 -c limits.memory=8GB -c image.os=windows -d root,size=30GiB
 incus config device set "${name}" root io.bus=virtio-blk
-incus config device add "${name}" iso disk source="${WINDIR}/${WINFILE}" boot.priority=10
+incus config device add "${name}" iso disk source="${WINPATH}" boot.priority=10
 incus config device add "${name}" incusagent disk source="agent:config"
 apparmr | incus config set "${name}" raw.apparmor=-
-printf -- '-drive file=%s,index=0,media=cdrom,if=ide -drive file=%s,index=1,media=cdrom,if=ide\n' "${WINDIR}/${WINFILE}" "${DESTDIR}/unattended-${VERSION}.iso" | incus config set "${name}" raw.qemu=-
+printf -- '-drive file=%s,index=0,media=cdrom,if=ide -drive file=%s,index=1,media=cdrom,if=ide\n' "${WINPATH}" "${UNATTPATH}" | incus config set "${name}" raw.qemu=-
 
 if [ X2008 = X"${VERSION}" ]; then
 	incus config set "${name}" security.csm=true
